@@ -1850,4 +1850,17 @@ func TestTngfUE(t *testing.T) {
 		t.Fatal("Ping Failed")
 		return
 	}
+
+	t.Logf("====== UE PDU Session Release Start ======")
+
+	pdu = nasTestpacket.GetUlNasTransport_PduSessionReleaseRequest(pduSessionId)
+	pdu, err = EncodeNasPduInEnvelopeWithSecurity(ue, pdu, nas.SecurityHeaderTypeIntegrityProtectedAndCiphered, true, false)
+	assert.Nil(t, err)
+
+	// send message to TNGF through TCP connection
+	_, err = tcpConnWithTNGF.Write(pdu)
+	assert.Nil(t, err)
+	t.Logf("Sent PDU Session Release Request for PDU Session ID: %d", pduSessionId)
+	
+	time.Sleep(5 * time.Second)
 }
