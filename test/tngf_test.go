@@ -258,7 +258,15 @@ func tngfEncryptProcedure(ikeSecurityAssociation *context.IKESecurityAssociation
 	}
 
 	encryptedData = append(encryptedData, make([]byte, checksumLength)...)
-	sk := responseIKEMessage.Payloads.BuildEncrypted(ikePayload[0].Type(), encryptedData)
+	var nextPayloadType message.IKEPayloadType
+	
+	if len(ikePayload) > 0 {
+		nextPayloadType = ikePayload[0].Type()
+	} else {
+		nextPayloadType = message.NoNext 
+	}
+	
+	sk := responseIKEMessage.Payloads.BuildEncrypted(nextPayloadType, encryptedData)
 
 	// Calculate checksum
 	responseIKEMessageData, err := responseIKEMessage.Encode()
@@ -877,6 +885,82 @@ func GetMessageAuthenticator(message *radiusMessage.RadiusMessage) []byte {
 	hmacFun := hmac.New(md5.New, radius_secret) // radius_secret is same as cfg's radius_secret
 	hmacFun.Write(radiusMessageData)
 	return hmacFun.Sum(nil)
+}
+
+func handleIKEDelete(
+	t *testing.T,
+	ikeConn *net.UDPConn,
+	ikeSA *context.IKESecurityAssociation,
+	childSA *context.ChildSecurityAssociation,
+	tngfUDPAddr *net.UDPAddr,
+	expectedProtocolID uint8,
+) {
+	t.Logf("====== Test UE: Waiting for IKE DELETE from TNGF (Step 5) ======")
+
+	buffer := make([]byte, 65535)
+	// 設置一個超時，以防收不到訊息
+	ikeConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, _, err := ikeConn.ReadFromUDP(buffer)
+	ikeConn.SetReadDeadline(time.Time{}) // 清除超時
+	if err != nil {
+		t.Fatalf("Read IKE Delete Message Fail: %+v", err)
+	}
+
+	ikeMessage := new(message.IKEMessage)
+	ikeMessage.Payloads.Reset()
+	err = ikeMessage.Decode(buffer[:n])
+	if err != nil {
+		t.Fatalf("Decode IKE Delete Message Fail: %+v", err)
+	}
+	assert.Equal(t, uint8(message.INFORMATIONAL), ikeMessage.ExchangeType, "Expected INFORMATIONAL exchange for DELETE")
+
+	encryptedPayload, ok := ikeMessage.Payloads[0].(*message.Encrypted)
+	assert.True(t, ok, "Received packet is not an encrypted payload")
+
+	decryptedIKEPayload, err := tngfDecryptProcedure(ikeSA, ikeMessage, encryptedPayload)
+	if err != nil {
+		t.Fatalf("Decrypt IKE Delete Message Fail: %+v", err)
+	}
+
+	var foundDelete bool
+	for _, p := range decryptedIKEPayload {
+		if p.Type() == message.TypeD {
+			deletePayload := p.(*message.Delete)
+			t.Logf("Received IKE DELETE payload for Protocol ID: %d, %d SPIs", deletePayload.ProtocolID, len(deletePayload.SPIs))
+			if deletePayload.ProtocolID == expectedProtocolID {
+				foundDelete = true
+			}
+		}
+	}
+	assert.True(t, foundDelete, "Did not receive the expected IKE DELETE payload")
+	t.Logf("====== Test UE: Successfully received and verified IKE DELETE ======")
+
+	
+	t.Logf("====== Test UE: Sending IKE DELETE Response (Step 6) ======")
+	responseIKEMessage := new(message.IKEMessage)
+    
+	responseIKEMessage.BuildIKEHeader(ikeMessage.ResponderSPI, ikeMessage.InitiatorSPI, message.INFORMATIONAL, message.ResponseBitCheck, ikeMessage.MessageID)
+
+	var responsePayload message.IKEPayloadContainer // An empty encrypted payload is a valid response
+
+	t.Logf("Including Delete Payload in response for paired SA with SPI [0x%x]", childSA.InboundSPI)
+    responsePayload.BuildDelete(message.TypeESP, 4, []uint32{childSA.InboundSPI})
+    
+
+	if err := tngfEncryptProcedure(ikeSA, responsePayload, responseIKEMessage); err != nil {
+		t.Fatalf("Encrypt IKE DELETE response failed: %+v", err)
+	}
+
+	// Send response to TNGF
+	ikeMessageData, err := responseIKEMessage.Encode()
+	if err != nil {
+		t.Fatalf("Encode IKE DELETE response failed: %+v", err)
+	}
+	_, err = ikeConn.WriteToUDP(ikeMessageData, tngfUDPAddr)
+	if err != nil {
+		t.Fatalf("Write IKE DELETE response failed: %+v", err)
+	}
+	t.Logf("====== Test UE: Successfully sent IKE DELETE Response ======")
 }
 
 func TestTngfUE(t *testing.T) {
@@ -1851,6 +1935,7 @@ func TestTngfUE(t *testing.T) {
 		return
 	}
 
+	// PDU session release
 	t.Logf("====== UE PDU Session Release Start ======")
 
 	pdu = nasTestpacket.GetUlNasTransport_PduSessionReleaseRequest(pduSessionId)
@@ -1862,5 +1947,6 @@ func TestTngfUE(t *testing.T) {
 	assert.Nil(t, err)
 	t.Logf("Sent PDU Session Release Request for PDU Session ID: %d", pduSessionId)
 	
-	time.Sleep(5 * time.Second)
+	handleIKEDelete(t, udpConnection, ikeSecurityAssociation, childSecurityAssociationContextUserPlane, tngfUDPAddr, message.TypeESP)
+
 }
